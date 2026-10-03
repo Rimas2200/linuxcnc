@@ -1478,12 +1478,9 @@ static void get_pos_cmds(long period)
     default:
 	break;
     }
-    /* check command against soft limits */
-    /* This is a backup check.  Upstream checks cover Cartesian bounds and
-       endpoint joint positions, but general kinematics can put a joint
-       outside its limits between endpoints.  Incorrect homing parameters
-       or limits changed after queueing a move can also escape those checks.
-    */
+    /* Runtime soft-limit check. Preflight checks can miss interior joints
+       in unsupported kinematics, blending and cubic interpolation, bad
+       homing parameters, or changes to limits/kinematics after queueing. */
     for (joint_num = 0; joint_num < ALL_JOINTS; joint_num++) {
 	/* point to joint data */
 	joint = &joints[joint_num];

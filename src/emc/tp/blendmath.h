@@ -253,6 +253,10 @@ PmCircleLimits pmCircleActualMaxVel(const PmCircle *circle,
 
 int findSpiralArcLengthFit(PmCircle const * const circle,
         SpiralArcLengthFit * const fit);
+int pmCircleAngleFromParam(PmCircle const * const circle,
+        SpiralArcLengthFit const * const fit,
+        double t,
+        double * const angle);
 int pmCircleAngleFromProgress(PmCircle const * const circle,
         SpiralArcLengthFit const * const fit,
         double progress,

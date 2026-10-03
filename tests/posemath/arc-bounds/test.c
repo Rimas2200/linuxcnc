@@ -74,6 +74,67 @@ static void check_points(PmCircle circle)
     }
 }
 
+static double dot(PmCartesian a, PmCartesian b)
+{
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+/* Check projection bounds against points evaluated on the original circle. */
+static void check_projection(PmCircle circle, PmCartesian direction)
+{
+    double min, max, seen_min = DBL_MAX, seen_max = -DBL_MAX;
+    const int count = 4000;
+    require(pmCircleProjectionBounds(&circle, &direction, &min, &max) == PM_OK,
+            "projection bounds failed");
+    for (int i = 0; i <= count; i++) {
+        PmCartesian point;
+        require(pmCirclePoint(&circle, circle.angle * i / count, &point) == PM_OK,
+                "projection point failed");
+        double value = dot(point, direction);
+        double tolerance = 1e-10 * (1 + fabs(value));
+        require(value >= min - tolerance && value <= max + tolerance,
+                "projection does not contain path");
+        seen_min = fmin(seen_min, value);
+        seen_max = fmax(seen_max, value);
+    }
+    double norm = sqrt(dot(direction, direction));
+    double speed = norm * (circle.radius + fabs(circle.spiral))
+        + (norm * fabs(circle.spiral) + fabs(dot(circle.rHelix, direction))) / circle.angle;
+    double tolerance = speed * circle.angle / count + 1e-9;
+    require(seen_min - min <= tolerance && max - seen_max <= tolerance,
+            "projection bounds are unnecessarily wide");
+}
+
+static void check_subsegment(PmCircle circle, double start, double end)
+{
+    PmCircle segment, in_place = circle;
+    require(pmCircleSubsegment(&circle, start, end, &segment) == PM_OK,
+            "subsegment failed");
+    require(pmCircleSubsegment(&in_place, start, end, &in_place) == PM_OK,
+            "in-place subsegment failed");
+    near(segment.angle, end - start, "subsegment angle");
+    for (int i = 0; i <= 100; i++) {
+        double angle = segment.angle * i / 100;
+        PmCartesian expected, point, aliased_point;
+        require(pmCirclePoint(&circle, start + angle, &expected) == PM_OK,
+                "subsegment reference point failed");
+        require(pmCirclePoint(&segment, angle, &point) == PM_OK,
+                "subsegment point failed");
+        require(pmCirclePoint(&in_place, angle, &aliased_point) == PM_OK,
+                "in-place subsegment point failed");
+        for (int axis = 0; axis < 3; axis++) {
+            double value = coordinate(expected, axis);
+            double tolerance = 3e-11 * (1 + fabs(value));
+            require(fabs(coordinate(point, axis) - value) <= tolerance,
+                    "subsegment changed the path");
+            near(coordinate(aliased_point, axis), coordinate(point, axis),
+                    "in-place subsegment changed the path");
+        }
+    }
+    check_points(segment);
+    check_projection(segment, (PmCartesian){1, -2, 0.5});
+}
+
 static unsigned random_state = 3839;
 static double random_unit(void)
 {
@@ -92,6 +153,25 @@ int main(void)
     near(max.x, 1, "quarter maximum X");
     near(max.y, 1, "quarter maximum Y");
     check_points(circle);
+
+    /* Summing XYZ bounds overestimates the joint range at this tangency. */
+    start = (PmCartesian){5, 5, 0};
+    circle = make_circle(start, start, zero, z, 0);
+    PmCartesian direction = {1, 1, 0};
+    double projected_min, projected_max;
+    require(pmCircleProjectionBounds(&circle, &direction,
+                &projected_min, &projected_max) == PM_OK, "CoreXY projection failed");
+    near(projected_min, -10, "CoreXY minimum");
+    near(projected_max, 10, "CoreXY maximum");
+    direction = (PmCartesian){1, -1, 0};
+    require(pmCircleProjectionBounds(&circle, &direction,
+                &projected_min, &projected_max) == PM_OK, "CoreXY difference failed");
+    near(projected_min, -10, "CoreXY difference minimum");
+    near(projected_max, 10, "CoreXY difference maximum");
+    check_projection(circle, direction);
+    check_projection(circle, zero);
+    check_subsegment(circle, PM_PI / 4, 7 * PM_PI / 4);
+    start = (PmCartesian){1, 0, 0};
 
     /* Exact tangency remains legal with the motion layer's 1e-12 epsilon,
        even when coordinates are much larger than that absolute tolerance. */
@@ -156,6 +236,12 @@ int main(void)
             "many-turn spiral missed the last turn");
     near(min.z, 0, "many-turn helix minimum Z");
     near(max.z, 10, "many-turn helix maximum Z");
+    PmCircle many_turns;
+    require(pmCircleSubsegment(&circle, 0, circle.angle * 0.75, &many_turns) == PM_OK,
+            "many-turn subsegment failed");
+    near(many_turns.angle, circle.angle * 0.75, "subsegment lost complete turns");
+    near(many_turns.spiral, 0.75, "many-turn subsegment spiral");
+    near(many_turns.rHelix.z, 7.5, "many-turn subsegment helix");
 
     /* Reproducible varied planes, directions, helices and inward/outward
        spirals exercise the general geometry independently of machine setup. */
@@ -168,8 +254,29 @@ int main(void)
             center.y + random_unit() * 20 - 10, center.z + random_unit() * 20 - 10};
         circle = make_circle(start, end, center, normal, i % 9 - 4);
         check_points(circle);
+        check_projection(circle, (PmCartesian){1, 1, 0});
+        check_projection(circle, (PmCartesian){-1.5, 2, -0.75});
+        check_subsegment(circle, circle.angle * 0.17, circle.angle * 0.81);
     }
 
+    PmCircle segment;
+    require(pmCircleSubsegment(&circle, 0, 0, &segment) != PM_OK,
+            "empty subsegment accepted");
+    require(pmCircleSubsegment(&circle, -1, circle.angle, &segment) != PM_OK,
+            "negative subsegment angle accepted");
+    require(pmCircleSubsegment(&circle, 0, circle.angle + 1, &segment) != PM_OK,
+            "subsegment beyond end accepted");
+    require(pmCircleSubsegment(&circle, NAN, circle.angle, &segment) != PM_OK,
+            "NaN subsegment angle accepted");
+    require(pmCircleSubsegment(&circle, 0, circle.angle, NULL) != PM_OK,
+            "null subsegment output accepted");
+    direction.x = INFINITY;
+    require(pmCircleProjectionBounds(&circle, &direction, &projected_min,
+                &projected_max) != PM_OK, "infinite projection direction accepted");
+    require(pmCircleProjectionBounds(&circle, NULL, &projected_min,
+                &projected_max) != PM_OK, "null projection direction accepted");
+    require(pmCircleProjectionBounds(&circle, &zero, NULL,
+                &projected_max) != PM_OK, "null projection output accepted");
     require(pmCircleBounds(NULL, &min, &max) != PM_OK, "null circle accepted");
     circle.angle = 0;
     require(pmCircleBounds(&circle, &min, &max) != PM_OK, "zero angle accepted");

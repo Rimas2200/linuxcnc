@@ -2103,68 +2103,141 @@ static void circleBoundInterval(PmCircleBound *b, double span)
     circleBoundMonotone(b, monotone_start, span);
 }
 
-/* Bound the complete Cartesian path, not only its end or sampled points.
-   At a fixed phase, radius and helix displacement are linear in the turn
-   number.  Thus extrema are in the first or last revolution, even for a
-   many-turn spiral/helix.  This keeps the work bounded in the motion thread. */
-int pmCircleBounds(PmCircle const * const circle,
-        PmCartesian * const min, PmCartesian * const max)
+static int circleBoundCartesianValid(const PmCartesian *p)
 {
-    double centers[3], tangents[3], perpendiculars[3], helices[3];
-    double lower[3], upper[3];
-    int axis, turn;
-    if (!circle || !min || !max || !isfinite(circle->radius)
+    return isfinite(p->x) && isfinite(p->y) && isfinite(p->z);
+}
+
+static int circleBoundValid(const PmCircle *circle)
+{
+    if (!circle || !isfinite(circle->radius)
             || !isfinite(circle->angle) || !isfinite(circle->spiral)
             || circle->radius <= 0 || circle->angle <= 0
             || !isfinite(circle->radius + circle->spiral)
             || circle->radius + circle->spiral < 0
-            || !isfinite(circle->normal.x) || !isfinite(circle->normal.y)
-            || !isfinite(circle->normal.z)
+            || !circleBoundCartesianValid(&circle->center)
+            || !circleBoundCartesianValid(&circle->normal)
+            || !circleBoundCartesianValid(&circle->rTan)
+            || !circleBoundCartesianValid(&circle->rPerp)
+            || !circleBoundCartesianValid(&circle->rHelix)
             || (circle->normal.x == 0 && circle->normal.y == 0 && circle->normal.z == 0))
+        return 0;
+    return 1;
+}
+
+/* At a fixed phase, radius and helix displacement are linear in the turn
+   number.  Thus extrema are in the first or last revolution, even for a
+   many-turn spiral/helix.  This keeps the work bounded in the motion thread. */
+static int circleBoundProjection(const PmCircle *circle, double center,
+        double tangent, double perpendicular, double helix,
+        double *min, double *max)
+{
+    double u = tangent / circle->radius;
+    double v = perpendicular / circle->radius;
+    PmCircleBound b;
+    int turn;
+    b.center = center;
+    b.radial_rate = circle->spiral / circle->angle;
+    b.helix_rate = helix / circle->angle;
+    b.amplitude = sqrt(u * u + v * v);
+    b.min = DBL_MAX;
+    b.max = -DBL_MAX;
+    b.valid = 1;
+    if (!isfinite(b.center) || !isfinite(b.radial_rate)
+            || !isfinite(b.helix_rate) || !isfinite(b.amplitude)
+            || !isfinite(helix))
+        return PM_ERR;
+    for (turn = 0; turn < 2; turn++) {
+        /* Traverse the last revolution backwards from the endpoint.
+           Subtracting 2*pi from a huge total angle would lose precision. */
+        double c = turn ? cos(circle->angle) : 1;
+        double s = turn ? sin(circle->angle) : 0;
+        b.radius = turn ? circle->radius + circle->spiral : circle->radius;
+        b.helix = turn ? helix : 0;
+        b.phase = atan2(turn ? u * s - v * c : v, u * c + v * s);
+        if (turn) {
+            b.radial_rate = -b.radial_rate;
+            b.helix_rate = -b.helix_rate;
+        }
+        circleBoundInterval(&b, fmin(PM_2_PI, circle->angle));
+        if (circle->angle <= PM_2_PI)
+            break;
+    }
+    if (!b.valid || !isfinite(b.min) || !isfinite(b.max) || b.min > b.max)
+        return PM_ERR;
+    *min = b.min;
+    *max = b.max;
+    return PM_OK;
+}
+
+int pmCircleProjectionBounds(PmCircle const * const circle,
+        PmCartesian const * const direction, double * const min, double * const max)
+{
+    double center, tangent, perpendicular, helix;
+    if (!circleBoundValid(circle) || !direction || !min || !max
+            || !circleBoundCartesianValid(direction))
+        return pmErrno = PM_ERR;
+    pmCartCartDot(&circle->center, direction, &center);
+    pmCartCartDot(&circle->rTan, direction, &tangent);
+    pmCartCartDot(&circle->rPerp, direction, &perpendicular);
+    pmCartCartDot(&circle->rHelix, direction, &helix);
+    return pmErrno = circleBoundProjection(circle, center, tangent,
+            perpendicular, helix, min, max);
+}
+
+/* Cartesian bounds of the complete arc. */
+int pmCircleBounds(PmCircle const * const circle,
+        PmCartesian * const min, PmCartesian * const max)
+{
+    PmCartesian lower, upper;
+    if (!circleBoundValid(circle) || !min || !max)
+        return pmErrno = PM_ERR;
+    if (circleBoundProjection(circle, circle->center.x, circle->rTan.x,
+                circle->rPerp.x, circle->rHelix.x, &lower.x, &upper.x) != PM_OK
+            || circleBoundProjection(circle, circle->center.y, circle->rTan.y,
+                circle->rPerp.y, circle->rHelix.y, &lower.y, &upper.y) != PM_OK
+            || circleBoundProjection(circle, circle->center.z, circle->rTan.z,
+                circle->rPerp.z, circle->rHelix.z, &lower.z, &upper.z) != PM_OK)
+        return pmErrno = PM_ERR;
+    *min = lower;
+    *max = upper;
+    return pmErrno = PM_OK;
+}
+
+int pmCircleSubsegment(PmCircle const * const circle, double start_angle,
+        double end_angle, PmCircle * const out)
+{
+    PmCircle segment;
+    double start_fraction, span_fraction, c, s, scale;
+    if (!circleBoundValid(circle) || !out || !isfinite(start_angle)
+            || !isfinite(end_angle) || start_angle < 0
+            || end_angle > circle->angle || start_angle >= end_angle)
         return pmErrno = PM_ERR;
 
-    centers[0] = circle->center.x; centers[1] = circle->center.y; centers[2] = circle->center.z;
-    tangents[0] = circle->rTan.x; tangents[1] = circle->rTan.y; tangents[2] = circle->rTan.z;
-    perpendiculars[0] = circle->rPerp.x; perpendiculars[1] = circle->rPerp.y; perpendiculars[2] = circle->rPerp.z;
-    helices[0] = circle->rHelix.x; helices[1] = circle->rHelix.y; helices[2] = circle->rHelix.z;
-    for (axis = 0; axis < 3; axis++) {
-        double u = tangents[axis] / circle->radius;
-        double v = perpendiculars[axis] / circle->radius;
-        PmCircleBound b;
-        b.center = centers[axis];
-        b.radial_rate = circle->spiral / circle->angle;
-        b.helix_rate = helices[axis] / circle->angle;
-        b.amplitude = sqrt(u * u + v * v);
-        b.min = DBL_MAX;
-        b.max = -DBL_MAX;
-        b.valid = 1;
-        if (!isfinite(b.center) || !isfinite(b.radial_rate)
-                || !isfinite(b.helix_rate) || !isfinite(b.amplitude)
-                || !isfinite(helices[axis]))
-            return pmErrno = PM_ERR;
-        for (turn = 0; turn < 2; turn++) {
-            /* Traverse the last revolution backwards from the endpoint.
-               Subtracting 2*pi from a huge total angle would lose precision. */
-            double c = turn ? cos(circle->angle) : 1;
-            double s = turn ? sin(circle->angle) : 0;
-            b.radius = turn ? circle->radius + circle->spiral : circle->radius;
-            b.helix = turn ? helices[axis] : 0;
-            b.phase = atan2(turn ? u * s - v * c : v, u * c + v * s);
-            if (turn) {
-                b.radial_rate = -b.radial_rate;
-                b.helix_rate = -b.helix_rate;
-            }
-            circleBoundInterval(&b, fmin(PM_2_PI, circle->angle));
-            if (circle->angle <= PM_2_PI)
-                break;
-        }
-        if (!b.valid || !isfinite(b.min) || !isfinite(b.max) || b.min > b.max)
-            return pmErrno = PM_ERR;
-        lower[axis] = b.min;
-        upper[axis] = b.max;
-    }
-    min->x = lower[0]; min->y = lower[1]; min->z = lower[2];
-    max->x = upper[0]; max->y = upper[1]; max->z = upper[2];
+    /* Restrict the parameterized curve directly.  Reinitializing from its
+       endpoints would lose complete turns and alter the radial/helix rates. */
+    segment = *circle;
+    segment.angle = end_angle - start_angle;
+    start_fraction = start_angle / circle->angle;
+    span_fraction = segment.angle / circle->angle;
+    segment.radius = circle->radius + start_fraction * circle->spiral;
+    segment.spiral = span_fraction * circle->spiral;
+    c = cos(start_angle);
+    s = sin(start_angle);
+    scale = segment.radius / circle->radius;
+    segment.rTan.x = scale * (c * circle->rTan.x + s * circle->rPerp.x);
+    segment.rTan.y = scale * (c * circle->rTan.y + s * circle->rPerp.y);
+    segment.rTan.z = scale * (c * circle->rTan.z + s * circle->rPerp.z);
+    segment.rPerp.x = scale * (c * circle->rPerp.x - s * circle->rTan.x);
+    segment.rPerp.y = scale * (c * circle->rPerp.y - s * circle->rTan.y);
+    segment.rPerp.z = scale * (c * circle->rPerp.z - s * circle->rTan.z);
+    segment.center.x += start_fraction * circle->rHelix.x;
+    segment.center.y += start_fraction * circle->rHelix.y;
+    segment.center.z += start_fraction * circle->rHelix.z;
+    pmCartScalMult(&circle->rHelix, span_fraction, &segment.rHelix);
+    if (!circleBoundValid(&segment))
+        return pmErrno = PM_ERR;
+    *out = segment;
     return pmErrno = PM_OK;
 }
 

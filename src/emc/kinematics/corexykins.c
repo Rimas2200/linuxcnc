@@ -65,10 +65,57 @@ int kinematicsHome(EmcPose *world
 
 KINEMATICS_TYPE kinematicsType() { return KINEMATICS_BOTH; }
 
+/* Bound X+Y and X-Y directly. Summing separate X/Y bounds can reject
+   valid arcs tangent to a joint limit. */
+int kinematicsInverseBounds(const KINEMATICS_PATH *path,
+                            double *joint_lower, double *joint_upper,
+                            int num_joints,
+                            const KINEMATICS_INVERSE_FLAGS *iflags)
+{
+    double lower[9], upper[9];
+    int i;
+    if (!path || !joint_lower || !joint_upper || num_joints < 1 || num_joints > 9)
+        return KINEMATICS_BOUNDS_UNKNOWN;
+
+    if (path->circle) {
+        const PmCartesian sum = {1, 1, 0}, difference = {1, -1, 0}, z = {0, 0, 1};
+        if (pmCircleProjectionBounds(path->circle, &sum, &lower[0], &upper[0])
+            || pmCircleProjectionBounds(path->circle, &difference, &lower[1], &upper[1])
+            || pmCircleProjectionBounds(path->circle, &z, &lower[2], &upper[2]))
+            return KINEMATICS_BOUNDS_UNKNOWN;
+    } else {
+        double start = path->start.tran.x + path->start.tran.y;
+        double end = path->end.tran.x + path->end.tran.y;
+        lower[0] = fmin(start, end);
+        upper[0] = fmax(start, end);
+        start = path->start.tran.x - path->start.tran.y;
+        end = path->end.tran.x - path->end.tran.y;
+        lower[1] = fmin(start, end);
+        upper[1] = fmax(start, end);
+        lower[2] = path->lower.tran.z; upper[2] = path->upper.tran.z;
+    }
+    lower[3] = path->lower.a; upper[3] = path->upper.a;
+    lower[4] = path->lower.b; upper[4] = path->upper.b;
+    lower[5] = path->lower.c; upper[5] = path->upper.c;
+    lower[6] = path->lower.u; upper[6] = path->upper.u;
+    lower[7] = path->lower.v; upper[7] = path->upper.v;
+    lower[8] = path->lower.w; upper[8] = path->upper.w;
+    for (i = 0; i < num_joints; i++) {
+        if (!isfinite(lower[i]) || !isfinite(upper[i]) || lower[i] > upper[i])
+            return KINEMATICS_BOUNDS_UNKNOWN;
+    }
+    for (i = 0; i < num_joints; i++) {
+        joint_lower[i] = lower[i];
+        joint_upper[i] = upper[i];
+    }
+    return KINEMATICS_BOUNDS_OK;
+}
+
 KINS_NOT_SWITCHABLE
 EXPORT_SYMBOL(kinematicsType);
 EXPORT_SYMBOL(kinematicsForward);
 EXPORT_SYMBOL(kinematicsInverse);
+EXPORT_SYMBOL(kinematicsInverseBounds);
 MODULE_LICENSE("GPL");
 
 static int comp_id;

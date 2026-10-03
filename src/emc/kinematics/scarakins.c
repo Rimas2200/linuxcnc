@@ -21,6 +21,7 @@
 #include "posemath.h"
 #include "hal.h"
 #include "kinematics.h"
+#include "kinematics_bounds.h"
 #include "switchkins.h"
 
 struct scara_data {
@@ -170,6 +171,28 @@ static int scaraKinematicsInverse(const EmcPose * world,
     return (0);
 } // scaraKinematicsInverse()
 
+static int scaraKinematicsInverseBounds(const KINEMATICS_PATH *path,
+                                       double *joint_lower, double *joint_upper,
+                                       int num_joints,
+                                       const KINEMATICS_INVERSE_FLAGS *iflags)
+{
+    double lower[6], upper[6];
+    if (!path || !joint_lower || !joint_upper || !iflags || !haldata ||
+        num_joints < 1 || num_joints > 6) {
+        return KINEMATICS_BOUNDS_UNKNOWN;
+    }
+    const double dimensions[6] = {D1, D2, D3, D4, D5, D6};
+    if (scaraInverseBounds(&path->lower, &path->upper, dimensions, *iflags,
+                           lower, upper)) {
+        return KINEMATICS_BOUNDS_UNKNOWN;
+    }
+    for (int joint = 0; joint < num_joints; joint++) {
+        joint_lower[joint] = lower[joint];
+        joint_upper[joint] = upper[joint];
+    }
+    return KINEMATICS_BOUNDS_OK;
+}
+
 #define DEFAULT_D1 490
 #define DEFAULT_D2 340
 #define DEFAULT_D3  50
@@ -223,6 +246,7 @@ int switchkinsSetup(kparms* kp,
     *kset0 = scaraKinematicsSetup;
     *kfwd0 = scaraKinematicsForward;
     *kinv0 = scaraKinematicsInverse;
+    kp->inverse_bounds[0] = scaraKinematicsInverseBounds;
 
     *kset1 = identityKinematicsSetup;
     *kfwd1 = identityKinematicsForward;

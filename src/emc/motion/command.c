@@ -67,6 +67,7 @@
 #include "motion_types.h"
 #include "homing.h"
 #include "axis.h"
+#include "kinematics_limits.h"
 
 #include "tp_debug.h"
 
@@ -78,6 +79,14 @@
 extern int motion_num_spindles;
 
 static int rehomeAll;
+
+/* Weak import for kinematics modules without bounds support.
+   The provider's definition must remain strong. */
+extern int kinematicsInverseBounds(const KINEMATICS_PATH *path,
+                                   double *joint_lower, double *joint_upper,
+                                   int num_joints,
+                                   const KINEMATICS_INVERSE_FLAGS *iflags)
+    __attribute__((weak));
 
 /* limits_ok() returns 1 if none of the hard limits are set,
    0 if any are set. Called on a linear and circular move. */
@@ -276,12 +285,42 @@ STATIC int inRange(EmcPose pos, int id, char *move_type)
     return in_range;
 }
 
-/* Unlike a line, a circular move can leave the axis limits even when both
-   endpoints are inside.  Check the bounds of the same circle as tpAddCircle,
-   starting at the end of the queued moves, not at the current position.
-   These are Cartesian bounds: they are not poses on the path and must not
-   be passed to inverse kinematics.  Joint limits are still checked at the
-   endpoint; arbitrary kinematics can have other extrema along the path. */
+/* Check joints between endpoints when the kinematics provides bounds.
+   inRange() checks the endpoint. */
+STATIC int jointPathInRange(EmcPose start, EmcPose end, const PmCircle *circle,
+                           int id, char *move_type)
+{
+    double lower[EMCMOT_MAX_JOINTS], upper[EMCMOT_MAX_JOINTS];
+    unsigned active = 0;
+    int joint_num, failing_joint = -1, direction = 0;
+
+    if (!kinematicsInverseBounds)
+        return 1;
+    for (joint_num = 0; joint_num < NO_OF_KINS_JOINTS; joint_num++) {
+        lower[joint_num] = joints[joint_num].min_pos_limit;
+        upper[joint_num] = joints[joint_num].max_pos_limit;
+        if (GET_JOINT_ACTIVE_FLAG(&joints[joint_num]))
+            active |= 1U << joint_num;
+    }
+    int result = kinematicsCheckPath(&start, &end, circle,
+            kinematicsInverseBounds, lower, upper, NO_OF_KINS_JOINTS,
+            active, &iflags, &failing_joint, &direction);
+    if (result == KINEMATICS_PATH_OK || result == KINEMATICS_PATH_UNSUPPORTED)
+        return 1;
+    if (result == KINEMATICS_PATH_LIMIT) {
+        reportError(_("%s move on line %d would exceed joint %d's %s limit"),
+                    move_type, id, failing_joint,
+                    direction < 0 ? _("negative") : _("positive"));
+    } else {
+        reportError(_("Cannot verify joint limits for %s move on line %d"),
+                    move_type, id);
+    }
+    return 0;
+}
+
+/* Check the same circle as tpAddCircle, starting at the end of the queue.
+   Cartesian bounds need not lie on the path, so they cannot be passed to
+   point inverse kinematics. Use the bounds provider for interior joints. */
 STATIC int circleInRange(EmcPose start, EmcPose end, PmCartesian center,
                          PmCartesian normal, int turn, int id)
 {
@@ -300,7 +339,8 @@ STATIC int circleInRange(EmcPose start, EmcPose end, PmCartesian center,
     /* ABCUVW are interpolated linearly and need only endpoint checks. */
     int lower_in_range = axisInRange(lower, id, "Circular");
     int upper_in_range = axisInRange(upper, id, "Circular");
-    return lower_in_range && upper_in_range;
+    return lower_in_range && upper_in_range
+        && jointPathInRange(start, end, &circle, id, "Circular");
 }
 
 /* legacy note:
@@ -1049,7 +1089,10 @@ void emcmotCommandHandler_locked(void *arg, long servo_period)
 		emcmotStatus->commandStatus = EMCMOT_COMMAND_INVALID_COMMAND;
 		SET_MOTION_ERROR_FLAG(1);
 		break;
-	    } else if (!inRange(emcmotCommand->pos, emcmotCommand->id, "Linear")) {
+	    } else if (!inRange(emcmotCommand->pos, emcmotCommand->id, "Linear")
+                       || !jointPathInRange(emcmotInternal->coord_tp.goalPos,
+                                            emcmotCommand->pos, NULL,
+                                            emcmotCommand->id, "Linear")) {
 		reportError(_("invalid params in linear command"));
 		emcmotStatus->commandStatus = EMCMOT_COMMAND_INVALID_PARAMS;
 		tpAbort(&emcmotInternal->coord_tp);

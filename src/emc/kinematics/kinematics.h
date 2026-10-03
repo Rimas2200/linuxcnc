@@ -71,6 +71,38 @@ typedef unsigned long int KINEMATICS_FORWARD_FLAGS;
    indicate this. */
 typedef unsigned long int KINEMATICS_INVERSE_FLAGS;
 
+/* start/end lie on the path; lower/upper bound each coordinate and need
+   not be reachable poses. circle describes the XYZ arc, or is NULL for a
+   line or point. The circle pointer is valid only during the bounds call. */
+typedef struct {
+    EmcPose start, end;
+    EmcPose lower, upper;
+    const PmCircle *circle;
+} KINEMATICS_PATH;
+
+enum {
+    KINEMATICS_BOUNDS_OK = 0,
+    KINEMATICS_BOUNDS_UNSUPPORTED = 1,
+    KINEMATICS_BOUNDS_UNKNOWN = -1
+};
+
+/* On OK, fill num_joints intervals enclosing the whole path for the given
+   inverse flags and geometry. UNKNOWN requests subdivision; UNSUPPORTED
+   means the current mode has no bounds implementation.
+   Called from the servo thread: use bounded work, allocate no memory, and
+   leave flags and kinematics state unchanged. */
+typedef int (*KINEMATICS_INVERSE_BOUNDS)(
+    const KINEMATICS_PATH *path,
+    double *joint_lower, double *joint_upper,
+    int num_joints, const KINEMATICS_INVERSE_FLAGS *iflags);
+
+/* Optional export.  Consumers must use a weak import so that existing
+   kinematics modules without this function continue to load. */
+extern int kinematicsInverseBounds(
+    const KINEMATICS_PATH *path,
+    double *joint_lower, double *joint_upper,
+    int num_joints, const KINEMATICS_INVERSE_FLAGS *iflags);
+
 /* the forward kinematics take joint values and determine world coordinates,
    given forward kinematics flags to resolve any ambiguities. The inverse
    flags are set to indicate their value appropriate to the joint values
@@ -118,6 +150,7 @@ typedef struct kinematics_parms {
                            // bitmask: 0x4 bit2: switchkins_type==2
   int   gui_kinstype; // may be reqd for parallel kins with vismach
                       // to select switchkins_type for gui pins
+  KINEMATICS_INVERSE_BOUNDS inverse_bounds[3]; // optional, one per switchkins type
 } kparms;
 
 /* map letters in a coordinates string to joint numbers

@@ -354,6 +354,7 @@ SRCHEADERS := \
     emc/ini/inihal.hh \
     emc/kinematics/cubic.h \
     emc/kinematics/kinematics.h \
+    emc/kinematics/kinematics_bounds.h \
     emc/kinematics/switchkins.h \
     emc/kinematics/genhexkins.h \
     emc/kinematics/genserkins.h \
@@ -1122,6 +1123,8 @@ tripodkins-objs := emc/kinematics/tripodkins.o
 
 obj-m += corexykins.o
 corexykins-objs := emc/kinematics/corexykins.o
+corexykins-objs += libnml/posemath/_posemath.o
+corexykins-objs += libnml/posemath/sincos.o $(MATHSTUB)
 
 obj-m += lineardeltakins.o
 lineardeltakins-objs := emc/kinematics/lineardeltakins.o
@@ -1219,6 +1222,8 @@ motmod-objs := emc/kinematics/cubic.o
 motmod-objs += emc/motion/axis.o
 motmod-objs += emc/motion/motion.o
 motmod-objs += emc/motion/command.o
+motmod-objs += emc/motion/kinematics_limits.o
+motmod-objs += emc/tp/circle_progress.o
 motmod-objs += emc/motion/control.o
 motmod-objs += emc/motion/simple_tp.o
 motmod-objs += emc/motion/emcmotutil.o
@@ -1238,6 +1243,7 @@ tpmod-objs += emc/tp/tcq.o
 tpmod-objs += emc/tp/tp.o
 tpmod-objs += emc/tp/spherical_arc.o
 tpmod-objs += emc/tp/blendmath.o
+tpmod-objs += emc/tp/circle_progress.o
 tpmod-objs += emc/nml_intf/emcpose.o
 tpmod-objs += libnml/posemath/_posemath.o
 tpmod-objs += libnml/posemath/sincos.o $(MATHSTUB)

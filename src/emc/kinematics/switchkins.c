@@ -221,6 +221,21 @@ int kinematicsInverse(const EmcPose * pos,
     return r;
 } // kinematicsInverse()
 
+int kinematicsInverseBounds(const KINEMATICS_PATH *path,
+                            double *joint_lower, double *joint_upper,
+                            int num_joints,
+                            const KINEMATICS_INVERSE_FLAGS *iflags)
+{
+    if (switchkins_type >= SWITCHKINS_MAX_TYPES) {
+        return KINEMATICS_BOUNDS_UNKNOWN;
+    }
+    KINEMATICS_INVERSE_BOUNDS bounds = kp.inverse_bounds[switchkins_type];
+    if (!bounds) {
+        return KINEMATICS_BOUNDS_UNSUPPORTED;
+    }
+    return bounds(path, joint_lower, joint_upper, num_joints, iflags);
+}
+
 KINEMATICS_TYPE kinematicsType()
 {
     return KINEMATICS_BOTH;
@@ -237,6 +252,7 @@ EXPORT_SYMBOL(kinematicsSwitch);
 EXPORT_SYMBOL(kinematicsType);
 EXPORT_SYMBOL(kinematicsForward);
 EXPORT_SYMBOL(kinematicsInverse);
+EXPORT_SYMBOL(kinematicsInverseBounds);
 MODULE_LICENSE("GPL");
 
 static int    comp_id;
@@ -254,6 +270,9 @@ int rtapi_app_main(void)
     kp.allow_duplicates  =  0;
     kp.fwd_iterates_mask =  0;
     kp.gui_kinstype      = -1; // negative means: not used
+    for (i = 0; i < SWITCHKINS_MAX_TYPES; i++) {
+        kp.inverse_bounds[i] = 0;
+    }
 
     kp.sparm = sparm; // module parm passed to kins
 

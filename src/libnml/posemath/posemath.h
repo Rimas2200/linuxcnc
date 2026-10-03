@@ -953,6 +953,13 @@ extern "C" {
        These are not joint-space bounds for nonidentity kinematics. */
     extern int pmCircleBounds(PmCircle const * const circle,
             PmCartesian * const min, PmCartesian * const max);
+    /* Extrema of dot(point, direction); direction need not be a unit vector. */
+    extern int pmCircleProjectionBounds(PmCircle const * const circle,
+            PmCartesian const * const direction, double * const min, double * const max);
+    /* Preserve the curve on 0 <= start_angle < end_angle <= circle->angle.
+       The output starts at local angle zero and may alias circle. */
+    extern int pmCircleSubsegment(PmCircle const * const circle, double start_angle,
+            double end_angle, PmCircle * const out);
     extern int pmCircleStretch(PmCircle * const circ, double new_angle, int from_end);
 
 /* slicky macros for item-by-item copying between C and C++ structs */

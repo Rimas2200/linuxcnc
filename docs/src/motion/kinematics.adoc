@@ -346,6 +346,54 @@ When they are contained in a single source file, kinematics modules
 may be compiled and installed by 'halcompile'. See the 'halcompile(1)' manpage or
 the HAL manual for more information.
 
+=== Optional joint bounds for linear and circular moves
+
+A kinematics module can provide the optional `kinematicsInverseBounds`
+function declared in `kinematics.h`. Motion uses it before queueing a
+G0/G1 or G2/G3 move to check joint limits between the endpoints.
+`corexykins` and the SCARA mode of `scarakins` provide this function.
+Modules and switchable modes without a provider retain the endpoint checks.
+
+The input `KINEMATICS_PATH` describes a segment of the commanded path:
+`start` and `end` are poses on that path, `lower` and `upper` enclose all
+its Cartesian coordinates, and `circle` is either NULL for a line or point,
+or the XYZ circle for the segment. ABCUVW follow the planner's progress parameter,
+including its spiral arc-length parameterization. The Cartesian bounds
+are not necessarily reachable poses and must not be treated as point
+inputs to inverse kinematics.
+
+For `KINEMATICS_BOUNDS_OK`, the provider must fill every requested joint
+interval with bounds containing all inverse-kinematics results on the
+segment, for the supplied inverse flags and current geometry. Bounds can
+be conservative. A provider must not change flags or other kinematics
+state, allocate memory, or perform work without a fixed execution bound.
+The check runs in the servo thread; providers must fit its execution budget.
+`KINEMATICS_BOUNDS_UNSUPPORTED` means that the current mode has no provider;
+`KINEMATICS_BOUNDS_UNKNOWN` means that this segment could not be bounded.
+A failed calculation must not fall back to endpoint checking.
+
+Motion subdivides segments whose joint bounds extend beyond the limits or
+could not be calculated. The check uses at most 64 segments, with subdivision
+depth at most 20. It rejects the move if that budget is exhausted. A valid path
+close to a limit, a singularity or an angle branch cut can be rejected when
+its bounds remain inconclusive. CoreXY uses exact linear projections of
+the circular geometry to avoid this loss of precision at tangent limits.
+SCARA uses Cartesian interval enclosures and retains the existing inverse
+function's clamp of unreachable radii; this is not a reachability check.
+
+Switchable modules register providers in `kparms.inverse_bounds`, indexed
+by kinematics type. `switchkins.c` dispatches the optional function to the
+active provider. Existing compiled kinematics modules do not need to
+export the new function: motion imports it weakly.
+
+[NOTE]
+This check bounds the commanded geometry before trajectory planning.
+It does not cover paths subsequently changed by blending or joint cubic
+interpolation, external offsets, or changes to limits, inverse branches
+or machine geometry after queueing. It does not replace the runtime
+joint-limit checks or provide a joint stopping-distance guarantee.
+Probe and rigid-tap commands retain their existing endpoint checks.
+
 === Kinematics module using the userkins.comp template
 
 Another way to create a custom kinematics module is to adapt the
