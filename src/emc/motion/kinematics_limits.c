@@ -1,13 +1,12 @@
 /* Conservative preflight checks for coordinated joint limits.
  * License: GPL Version 2
  */
-#include <limits.h>
 #include "kinematics_limits.h"
 #include "kinematics_bounds.h"
 #include "blendmath.h"
 #include "rtapi_math.h"
 
-enum { PATH_MAX_JOINTS = sizeof(unsigned) * CHAR_BIT };
+enum { PATH_MAX_JOINTS = sizeof(unsigned) * __CHAR_BIT__ };
 
 typedef struct {
     double start, end;

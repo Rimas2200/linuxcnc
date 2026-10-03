@@ -9,6 +9,7 @@ duplicate_warning = re.compile("WARNING: [^ ]*: '(.*?)' exported twice. Previous
 permitted_duplicates = ['kinematicsType', \
                         'kinematicsForward', \
                         'kinematicsInverse', \
+                        'kinematicsInverseBounds', \
                         'kinematicsSwitch', \
                         'kinematicsSwitchable', \
                        ]
