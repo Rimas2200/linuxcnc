@@ -1,6 +1,5 @@
 #!/bin/bash
 set -e
-chmod +x test-ui.py
 rm -f result.log positions.csv
 if ! linuxcnc -r test.ini > linuxcnc.log 2>&1; then
     cat linuxcnc.log >&2

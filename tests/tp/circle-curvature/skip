@@ -1,0 +1,3 @@
+#!/bin/sh
+# This test compiles internal TP sources and requires a run-in-place build.
+[ -z "$SYSTEM_BUILD" ]
