@@ -4,6 +4,8 @@ set -eu
 # Drop unused TP functions at link time.
 TOPDIR=$(dirname "$HEADERS")
 trap 'rm -f test-circle-arc-limits' EXIT HUP INT TERM
+set -f
+# shellcheck disable=SC2086
 "${CC:-cc}" ${CFLAGS:--O2} -std=gnu11 -Wall -Wextra -fno-fast-math \
     -ffunction-sections -fdata-sections -DULAPI \
     -I"$HEADERS" -I"$TOPDIR/src" -I"$TOPDIR/src/emc" -I"$TOPDIR/src/emc/tp" \

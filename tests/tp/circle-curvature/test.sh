@@ -7,6 +7,8 @@ build=$(mktemp -d)
 trap 'rm -rf -- "$build"' EXIT
 
 # Drop unused controller functions at link time.
+set -f
+# shellcheck disable=SC2086
 "${CC:-cc}" ${CFLAGS:--O2 -g} -std=gnu11 -Wall -Wextra -fno-fast-math \
     -ffunction-sections -fdata-sections -DULAPI \
     -I"$root/src/emc/tp" -I"$root/src/libposemath" -I"$root/src/rtapi" \
