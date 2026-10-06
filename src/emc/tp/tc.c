@@ -63,10 +63,11 @@ double tcGetMaxTargetVel(TC_STRUCT const * const tc,
     return fmin(v_max_target, tc->maxvel);
 }
 
-static double tcOverallMaxAccelScaled(const TC_STRUCT *tc, int apply_parabolic)
+static double tcScaleOverallMaxAccel(double maxaccel, double kink_reduce,
+        double kink_reduce_prev, int parabolic)
 {
     // Handle any acceleration reduction due to an approximate-tangent "blend" with the previous or next segment
-    double a_scale = (1.0 - fmax(tc->kink_accel_reduce, tc->kink_accel_reduce_prev));
+    double a_scale = (1.0 - fmax(kink_reduce, kink_reduce_prev));
 
     // Parabolic blending conditions: If the next segment or previous segment
     // has a parabolic blend with this one, acceleration is scaled down by 1/2
@@ -74,16 +75,32 @@ static double tcOverallMaxAccelScaled(const TC_STRUCT *tc, int apply_parabolic)
     // physically required while both segments accelerate simultaneously in the
     // blend overlap; callers that need the geometric corner limit pass
     // apply_parabolic != 0, the per-cycle motion cap gates it on the overlap.
-    if (apply_parabolic && (tc->blend_prev || TC_TERM_COND_PARABOLIC == tc->term_cond)) {
+    if (parabolic) {
         a_scale *= 0.5;
     }
 
-    return tc->maxaccel * a_scale;
+    return maxaccel * a_scale;
+}
+
+static double tcOverallMaxAccelScaled(const TC_STRUCT *tc, int apply_parabolic)
+{
+    return tcScaleOverallMaxAccel(tc->maxaccel, tc->kink_accel_reduce,
+            tc->kink_accel_reduce_prev,
+            apply_parabolic && (tc->blend_prev || tc->term_cond == TC_TERM_COND_PARABOLIC));
 }
 
 double tcGetOverallMaxAccel(const TC_STRUCT *tc)
 {
     return tcOverallMaxAccelScaled(tc, 1);
+}
+
+double tcGetArcBlendMaxAccel(const TC_STRUCT *tc, int previous)
+{
+    /* Ignore reductions at this junction; retain those at the other end. */
+    return tcScaleOverallMaxAccel(tc->maxaccel,
+            previous ? 0.0 : tc->kink_accel_reduce,
+            previous ? tc->kink_accel_reduce_prev : 0.0,
+            previous ? tc->blend_prev : tc->term_cond == TC_TERM_COND_PARABOLIC);
 }
 
 /**
@@ -837,7 +854,11 @@ int pmCircle9Init(PmCircle9 * const circ9,
     int abc_fail = pmCartLineInit(&circ9->abc, &start_abc, &end_abc);
     int uvw_fail = pmCartLineInit(&circ9->uvw, &start_uvw, &end_uvw);
 
-    int res_fit = findSpiralArcLengthFit(&circ9->xyz,&circ9->fit);
+    double curvature;
+    int res_geometry = xyz_fail ? TP_ERR_FAIL :
+        pmCircleMaxCurvature(&circ9->xyz, &curvature);
+    int res_fit = res_geometry ? TP_ERR_FAIL :
+        findSpiralArcLengthFit(&circ9->xyz, &circ9->fit);
 
     if (xyz_fail || abc_fail || uvw_fail || res_fit) {
         rtapi_print_msg(RTAPI_MSG_ERR,"Failed to initialize Circle9, err codes %d, %d, %d, %d\n",
@@ -857,52 +878,28 @@ double pmCircle9Target(PmCircle9 const * const circ9)
     return helical_length;
 }
 
-/**
- * Apply acceleration and jerk limits to circular/spherical arc segments.
- *
- * For any arc (TC_CIRCULAR or TC_SPHERICAL), this function:
- * 1. Limits velocity based on centripetal acceleration budget
- * 2. For planner_type 1 (S-curve), applies three jerk constraints:
- *    - Steady-state rotational jerk: v³/R²
- *    - Normal jerk from tangential acceleration coupling: 3·v·a_t/R
- *    - Entry/exit transition jerk at arc boundaries
- * 3. Calculates the tangential acceleration ratio for the arc
- *
- * This unified approach ensures consistent jerk limiting for both
- * programmed arcs (G2/G3) and blend arcs at segment corners.
- */
-int tcUpdateArcLimits(TC_STRUCT * tc)
+/* Use separate radii for normal acceleration and the existing jerk limits. */
+static int tcArcLimitsForRadius(TC_STRUCT const *tc, double radius,
+        double jerk_radius, double angle, double input_maxvel,
+        double a_max, double *maxvel, double *tangent_ratio)
 {
-    double radius, angle;
-
-    // Extract radius and angle based on motion type
-    switch (tc->motion_type) {
-        case TC_CIRCULAR:
-            radius = pmCircleEffectiveMinRadius(&tc->coords.circle.xyz);
-            angle = tc->coords.circle.xyz.angle;
-            break;
-        case TC_SPHERICAL:
-            radius = tc->coords.arc.xyz.radius;
-            angle = tc->coords.arc.xyz.angle;
-            break;
-        default:
-            return 1; // Not an arc, nothing to do
+    if (!isfinite(radius) || radius <= 0.0 ||
+        !isfinite(jerk_radius) || jerk_radius <= 0.0 ||
+        !isfinite(angle) || angle <= 0.0 ||
+        !isfinite(a_max) || a_max <= 0.0 ||
+        !isfinite(input_maxvel) || input_maxvel < 0.0 ||
+        !isfinite(tc->cycle_time) || tc->cycle_time <= 0.0) {
+        return TP_ERR_FAIL;
     }
-
-    if (radius < DOUBLE_FUZZ || angle < TP_ANGLE_EPSILON) {
-        return 1; // Degenerate arc
-    }
-
-    double a_max = tcGetOverallMaxAccel(tc);
     double a_n_max_cutoff = BLEND_ACC_RATIO_NORMAL * a_max;
 
     // Find the acceleration necessary to reach the maximum velocity
-    double a_n_vmax = pmSq(tc->maxvel) / radius;
+    double a_n_vmax = pmSq(input_maxvel) / radius;
 
     // Find the maximum velocity that still obeys our desired normal/total acceleration ratio
     double v_max_cutoff = pmSqrt(a_n_max_cutoff * radius);
 
-    double v_max_actual = tc->maxvel;
+    double v_max_actual = input_maxvel;
     double acc_ratio_tan = BLEND_ACC_RATIO_TANGENTIAL;
 
     if (a_n_vmax > a_n_max_cutoff) {
@@ -916,7 +913,7 @@ int tcUpdateArcLimits(TC_STRUCT * tc)
         tc->cycle_time > TP_TIME_EPSILON) {
 
         double jerk = emcmotStatus->jerk;
-        double R_sq = pmSq(radius);
+        double R_sq = pmSq(jerk_radius);
 
         // Constraint 1: Steady-state rotational jerk + entry/exit transitions
         // The jerk budget is shared between steady-state (v³/R²) and transitions.
@@ -928,12 +925,17 @@ int tcUpdateArcLimits(TC_STRUCT * tc)
         // During S-curve ramps on arc: j_n = 3·v·a_t/R
         // Using BLEND_ACC_RATIO_TANGENTIAL as max tangential accel ratio
         double a_t_max = BLEND_ACC_RATIO_TANGENTIAL * a_max;
-        double v_max_jerk_tan = jerk * radius / (3.0 * a_t_max);
+        double v_max_jerk_tan = jerk * jerk_radius / (3.0 * a_t_max);
 
         // Constraint 3: Entry/exit transition jerk (centripetal accel ramp)
         // At line-arc boundary, centripetal accel changes from 0 to v²/R
         // j_entry = (v²/R) / cycle_time ≤ j_max
-        double v_max_jerk_entry = pmSqrt(jerk * radius * tc->cycle_time);
+        double v_max_jerk_entry = pmSqrt(jerk * jerk_radius * tc->cycle_time);
+
+        if (!isfinite(v_max_jerk_steady) || !isfinite(v_max_jerk_tan) ||
+            !isfinite(v_max_jerk_entry)) {
+            return TP_ERR_FAIL;
+        }
 
         double v_max_jerk = fmin(fmin(v_max_jerk_steady, v_max_jerk_tan), v_max_jerk_entry);
 
@@ -955,8 +957,80 @@ int tcUpdateArcLimits(TC_STRUCT * tc)
         }
     }
 
-    tc->maxvel = v_max_actual;
-    tc->acc_ratio_tan = acc_ratio_tan;
+    if (!isfinite(v_max_actual) || v_max_actual < 0.0 ||
+        !isfinite(acc_ratio_tan) || acc_ratio_tan < 0.0 ||
+        acc_ratio_tan > 1.0) {
+        return TP_ERR_FAIL;
+    }
+    *maxvel = v_max_actual;
+    *tangent_ratio = acc_ratio_tan;
+    return TP_ERR_OK;
+}
+
+static int tcComputeArcLimits(TC_STRUCT const *tc, PmCircle const *circle,
+        double input_maxvel, double a_max,
+        double *maxvel_out, double *tangent_ratio_out)
+{
+    if (!tc) {
+        return TP_ERR_FAIL;
+    }
+
+    double radius, legacy_radius, angle;
+    switch (tc->motion_type) {
+        case TC_CIRCULAR: {
+            double curvature;
+            if (pmCircleMaxCurvature(circle, &curvature)) {
+                return TP_ERR_FAIL;
+            }
+            legacy_radius = pmCircleLegacyMinRadius(circle);
+            /* For a spiral, progress is not spatial arc length. */
+            radius = circle->spiral == 0.0 ? 1.0 / curvature : legacy_radius;
+            angle = circle->angle;
+            break;
+        }
+        case TC_SPHERICAL:
+            radius = legacy_radius = tc->coords.arc.xyz.radius;
+            angle = tc->coords.arc.xyz.angle;
+            break;
+        default:
+            return TP_ERR_NO_ACTION;
+    }
+
+    double maxvel, tangent_ratio;
+    if (tcArcLimitsForRadius(tc, legacy_radius, legacy_radius, angle, input_maxvel, a_max,
+                &maxvel, &tangent_ratio)) {
+        return TP_ERR_FAIL;
+    }
+    if (radius != legacy_radius) {
+        double geometric_maxvel, geometric_tangent_ratio;
+        if (tcArcLimitsForRadius(tc, radius, fmin(radius, legacy_radius), angle, input_maxvel, a_max,
+                    &geometric_maxvel, &geometric_tangent_ratio)) {
+            return TP_ERR_FAIL;
+        }
+        /* Keep the tighter of the old and geometric limits. */
+        maxvel = fmin(maxvel, geometric_maxvel);
+        tangent_ratio = fmin(tangent_ratio, geometric_tangent_ratio);
+    }
+
+    *maxvel_out = maxvel;
+    *tangent_ratio_out = tangent_ratio;
+
+    return TP_ERR_OK;
+}
+
+int tcUpdateArcLimits(TC_STRUCT *tc)
+{
+    if (!tc) {
+        return TP_ERR_FAIL;
+    }
+    double maxvel, tangent_ratio;
+    int result = tcComputeArcLimits(tc, &tc->coords.circle.xyz,
+            tc->maxvel, tcGetOverallMaxAccel(tc), &maxvel, &tangent_ratio);
+    if (result != TP_ERR_OK) {
+        return result;
+    }
+    tc->maxvel = maxvel;
+    tc->acc_ratio_tan = tangent_ratio;
 
     tp_debug_print("tcUpdateArcLimits: final v_max=%f acc_ratio_tan=%f\n",
                    tc->maxvel, tc->acc_ratio_tan);
@@ -985,9 +1059,11 @@ int tcFinalizeLength(TC_STRUCT * const tc)
 
     tp_debug_print("Finalizing motion id %d, type %d\n", tc->id, tc->motion_type);
 
-    tcClampVelocityByLength(tc);
-
-    tcUpdateArcLimits(tc);
+    double old_maxvel = tc->maxvel;
+    if (tcClampVelocityByLength(tc) < 0 || tcUpdateArcLimits(tc) < 0) {
+        tc->maxvel = old_maxvel;
+        return TP_ERR_FAIL;
+    }
 
     tc->finalized = 1;
     return TP_ERR_OK;
@@ -997,7 +1073,9 @@ int tcFinalizeLength(TC_STRUCT * const tc)
 int tcClampVelocityByLength(TC_STRUCT * const tc)
 {
     //Apply velocity corrections
-    if (!tc) {
+    if (!tc || !isfinite(tc->target) || tc->target < 0.0 ||
+        !isfinite(tc->cycle_time) || tc->cycle_time <= 0.0 ||
+        !isfinite(tc->maxvel) || tc->maxvel < 0.0) {
         return TP_ERR_FAIL;
     }
 
@@ -1065,15 +1143,15 @@ double pmRigidTapTarget(PmRigidTap * const tap, double uu_per_rev)
     return target;
 }
 
-/**
- * Given a PmCircle and a circular segment, copy the circle in as the XYZ portion of the segment, then update the motion parameters.
- * NOTE: does not yet support ABC or UVW motion!
- */
-int tcSetCircleXYZ(TC_STRUCT * const tc, PmCircle const * const circ)
+/* Prepare a replacement circle without changing the TC. XYZ only. */
+int tcPrepareCircleXYZ(TC_STRUCT const *tc, PmCircle const *circ, double overall_accel,
+        PmCircle9 *circle_out, double *target_out, double *maxvel_out,
+        double *tangent_ratio_out)
 {
 
     //Update targets with new arc length
-    if (!circ || tc->motion_type != TC_CIRCULAR) {
+    if (!tc || !circ || !circle_out || !target_out || !maxvel_out ||
+        !tangent_ratio_out || tc->motion_type != TC_CIRCULAR) {
         return TP_ERR_FAIL;
     }
     if (!tc->coords.circle.abc.tmag_zero || !tc->coords.circle.uvw.tmag_zero) {
@@ -1081,20 +1159,47 @@ int tcSetCircleXYZ(TC_STRUCT * const tc, PmCircle const * const circ)
         return TP_ERR_FAIL;
     }
 
-    // Store the new circular segment (or use the current one)
-
-    if (!circ) {
-        rtapi_print_msg(RTAPI_MSG_ERR, "SetCircleXYZ missing new circle definition\n");
+    PmCircle9 candidate = tc->coords.circle;
+    candidate.xyz = *circ;
+    double curvature;
+    if (pmCircleMaxCurvature(circ, &curvature) < 0 ||
+        findSpiralArcLengthFit(circ, &candidate.fit) < 0) {
         return TP_ERR_FAIL;
     }
+    double target = pmCircle9Target(&candidate);
+    if (!isfinite(target) || target <= 0.0 ||
+        !isfinite(tc->cycle_time) || tc->cycle_time <= 0.0 ||
+        !isfinite(tc->maxvel) || tc->maxvel < 0.0) {
+        return TP_ERR_FAIL;
+    }
+    double maxvel, tangent_ratio;
+    if (tcComputeArcLimits(tc, circ, fmin(tc->maxvel, target / tc->cycle_time),
+                overall_accel, &maxvel, &tangent_ratio) < 0) {
+        return TP_ERR_FAIL;
+    }
+    *circle_out = candidate;
+    *target_out = target;
+    *maxvel_out = maxvel;
+    *tangent_ratio_out = tangent_ratio;
 
-    tc->coords.circle.xyz = *circ;
-    // Update the arc length fit to this new segment
-    findSpiralArcLengthFit(&tc->coords.circle.xyz, &tc->coords.circle.fit);
+    return TP_ERR_OK;
+}
 
-    // compute the new total arc length using the fit and store as new
-    // target distance
-    tc->target = pmCircle9Target(&tc->coords.circle);
+int tcSetCircleXYZ(TC_STRUCT *tc, PmCircle const *circ)
+{
+    if (!tc) {
+        return TP_ERR_FAIL;
+    }
+    PmCircle9 candidate;
+    double target, maxvel, tangent_ratio;
+    if (tcPrepareCircleXYZ(tc, circ, tcGetOverallMaxAccel(tc), &candidate, &target, &maxvel,
+                &tangent_ratio) < 0) {
+        return TP_ERR_FAIL;
+    }
+    tc->coords.circle = candidate;
+    tc->target = target;
+    tc->maxvel = maxvel;
+    tc->acc_ratio_tan = tangent_ratio;
 
     return TP_ERR_OK;
 }

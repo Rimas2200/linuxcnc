@@ -250,7 +250,11 @@ int pmCircleAngleFromProgress(PmCircle const * const circle,
         SpiralArcLengthFit const * const fit,
         double progress,
         double * const angle);
+/* Requires an initialized PmCircle; leaves the output unchanged on error. */
+int pmCircleMaxCurvature(const PmCircle *circle, double *kappa_max);
+/* Returns zero if the curvature or its reciprocal is not representable. */
 double pmCircleEffectiveMinRadius(const PmCircle *circle);
+double pmCircleLegacyMinRadius(const PmCircle *circle);
 
 static inline double findVPeak(double a_t_max, double distance)
 {

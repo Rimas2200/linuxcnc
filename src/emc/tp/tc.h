@@ -27,6 +27,7 @@ double tcGetMaxTargetVel(TC_STRUCT const * const tc,
         double max_scale);
 
 double tcGetOverallMaxAccel(TC_STRUCT const * tc);
+double tcGetArcBlendMaxAccel(TC_STRUCT const *tc, int previous);
 double tcGetTangentialMaxAccel(TC_STRUCT const * const tc);
 double tcGetCycleMaxAccel(TC_STRUCT const * const tc, int in_overlap);
 
@@ -116,6 +117,11 @@ int tcClampVelocityByLength(TC_STRUCT * const tc);
 
 
 int tcSetCircleXYZ(TC_STRUCT * const tc, PmCircle const * const circ);
+
+/* Outputs are unchanged on failure. */
+int tcPrepareCircleXYZ(TC_STRUCT const *tc, PmCircle const *circ, double overall_accel,
+        PmCircle9 *circle_out, double *target_out, double *maxvel_out,
+        double *tangent_ratio_out);
 
 int tcClearFlags(TC_STRUCT * const tc);
 

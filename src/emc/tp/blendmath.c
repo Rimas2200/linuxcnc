@@ -19,6 +19,7 @@
 #include "tp_types.h"
 #include "spherical_arc.h"
 #include "blendmath.h"
+#include "circle_curvature.h"
 #include "tp_debug.h"
 #include "../motion/motion.h"
 #include "../motion/mot_priv.h"
@@ -1845,12 +1846,8 @@ int pmCircleAngleFromProgress(PmCircle const * const circle,
 }
 
 
-/**
- * Find the effective minimum radius for acceleration calculations.
- * The radius of curvature of a spiral is larger than the circle of the same
- * radius.
- */
-double pmCircleEffectiveMinRadius(PmCircle const * circle)
+/* Original radius estimate retained for existing motion limits. */
+double pmCircleLegacyMinRadius(PmCircle const * circle)
 {
     double dr = circle->spiral / circle->angle;
     double h2;
@@ -1868,3 +1865,31 @@ double pmCircleEffectiveMinRadius(PmCircle const * circle)
     return effective_radius;
 }
 
+int pmCircleMaxCurvature(const PmCircle *circle, double *kappa_max)
+{
+    if (!circle || !kappa_max || !isfinite(circle->rHelix.x) ||
+            !isfinite(circle->rHelix.y) || !isfinite(circle->rHelix.z)) {
+        return -1;
+    }
+    double scale = fmax(fabs(circle->rHelix.x),
+                       fmax(fabs(circle->rHelix.y), fabs(circle->rHelix.z)));
+    double rise = 0.0;
+    if (scale > 0.0) {
+        double x = circle->rHelix.x / scale;
+        double y = circle->rHelix.y / scale;
+        double z = circle->rHelix.z / scale;
+        rise = scale * sqrt(x * x + y * y + z * z);
+    }
+    return tpCircleMaxCurvature(circle->radius, circle->spiral, circle->angle,
+                                rise, kappa_max);
+}
+
+double pmCircleEffectiveMinRadius(const PmCircle *circle)
+{
+    double curvature;
+    if (pmCircleMaxCurvature(circle, &curvature)) {
+        return 0.0;
+    }
+    double radius = 1.0 / curvature;
+    return isfinite(radius) && radius > 0.0 ? radius : 0.0;
+}

@@ -873,7 +873,9 @@ STATIC int tpInitBlendArcFromPrev(TP_STRUCT const * const tp,
 
     //NOTE: blend arc radius and everything else is finalized, so set this to 1.
     //In the future, radius may be adjustable.
-    tcFinalizeLength(blend_tc);
+    if (tcFinalizeLength(blend_tc) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     // copy state tag from previous segment during blend motion
     blend_tc->tag = prev_tc->tag;
@@ -881,21 +883,60 @@ STATIC int tpInitBlendArcFromPrev(TP_STRUCT const * const tp,
     return TP_ERR_OK;
 }
 
-STATIC int tcSetLineXYZ(TC_STRUCT * const tc, PmCartLine const * const line)
+/* Avoid full TC copies on the realtime stack during blend construction. */
+typedef struct {
+    union {
+        PmCircle9 circle;
+        PmLine9 line;
+    } coords;
+    double target, maxvel, acc_ratio_tan;
+} tp_prepared_geometry_t;
+
+STATIC __attribute__((__noinline__))
+int tpPrepareGeometryChange(TC_STRUCT const *tc, PmCircle const *circle,
+        PmCartLine const *line, int previous, tp_prepared_geometry_t *prepared)
 {
-
-    //Update targets with new arc length
-    if (!line || tc->motion_type != TC_LINEAR) {
+    if (circle) {
+        return tcPrepareCircleXYZ(tc, circle, tcGetArcBlendMaxAccel(tc, previous), &prepared->coords.circle,
+                &prepared->target, &prepared->maxvel, &prepared->acc_ratio_tan);
+    }
+    if (!line || tc->motion_type != TC_LINEAR ||
+        !tc->coords.line.abc.tmag_zero || !tc->coords.line.uvw.tmag_zero ||
+        !isfinite(line->tmag) || line->tmag < 0.0 ||
+        !isfinite(tc->cycle_time) || tc->cycle_time <= 0.0 ||
+        !isfinite(tc->maxvel) || tc->maxvel < 0.0) {
         return TP_ERR_FAIL;
     }
-    if (!tc->coords.line.abc.tmag_zero || !tc->coords.line.uvw.tmag_zero) {
-        rtapi_print_msg(RTAPI_MSG_ERR, "SetLineXYZ does not supportABC or UVW motion\n");
-        return TP_ERR_FAIL;
-    }
-
-    tc->coords.line.xyz = *line;
-    tc->target = line->tmag;
+    prepared->coords.line = tc->coords.line;
+    prepared->coords.line.xyz = *line;
+    prepared->target = line->tmag;
+    prepared->maxvel = fmin(tc->maxvel, line->tmag / tc->cycle_time);
+    prepared->acc_ratio_tan = tc->acc_ratio_tan;
     return TP_ERR_OK;
+}
+
+STATIC void tpCommitGeometryChange(TC_STRUCT *tc,
+        tp_prepared_geometry_t const *prepared)
+{
+    if (tc->motion_type == TC_CIRCULAR) {
+        tc->coords.circle = prepared->coords.circle;
+    } else {
+        tc->coords.line = prepared->coords.line;
+    }
+    tc->target = prepared->target;
+    tc->maxvel = prepared->maxvel;
+    tc->acc_ratio_tan = prepared->acc_ratio_tan;
+}
+
+/* Check finalization without changing the queued segment. */
+STATIC __attribute__((__noinline__))
+int tpValidateFinalization(TC_STRUCT const *tc)
+{
+    if (!tc) {
+        return TP_ERR_OK;
+    }
+    TC_STRUCT candidate = *tc;
+    return tcFinalizeLength(&candidate);
 }
 
 
@@ -1098,8 +1139,10 @@ tp_err_t tpCreateLineArcBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, T
     blend_tc->coords.arc.uvw = prev_tc->coords.line.uvw.end;
 
     //set the max velocity to v_plan, since we'll violate constraints otherwise.
-    tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
-            param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk));
+    if (tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
+                param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk)) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     int res_tangent = checkTangentAngle(&circ2_temp,
             &blend_tc->coords.arc.xyz,
@@ -1110,6 +1153,12 @@ tp_err_t tpCreateLineArcBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, T
 
     if (res_tangent < 0) {
         tp_debug_print("failed tangent check, aborting arc...\n");
+        return TP_ERR_FAIL;
+    }
+
+    tp_prepared_geometry_t prepared1, prepared2;
+    if (tpPrepareGeometryChange(prev_tc, NULL, &line1_temp, 1, &prepared1) < 0 ||
+        tpPrepareGeometryChange(tc, &circ2_temp, NULL, 0, &prepared2) < 0) {
         return TP_ERR_FAIL;
     }
 
@@ -1127,11 +1176,11 @@ tp_err_t tpCreateLineArcBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, T
             return TP_ERR_FAIL;
         }
     } else {
-        tcSetLineXYZ(prev_tc, &line1_temp);
+        tpCommitGeometryChange(prev_tc, &prepared1);
         //KLUDGE the previous segment is still there, so we don't need the at-speed flag on the blend too
         blend_tc->atspeed=0;
     }
-    tcSetCircleXYZ(tc, &circ2_temp);
+    tpCommitGeometryChange(tc, &prepared2);
 
     tcSetTermCond(prev_tc, tc, TC_TERM_COND_TANGENT);
 
@@ -1256,12 +1305,20 @@ tp_err_t tpCreateArcLineBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, T
     blend_tc->coords.arc.uvw = tc->coords.line.uvw.start;
 
     //set the max velocity to v_plan, since we'll violate constraints otherwise.
-    tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
-            param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk));
+    if (tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
+                param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk)) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     int res_tangent = checkTangentAngle(&circ1_temp, &blend_tc->coords.arc.xyz, &geom, &param, tp->cycleTime, false);
     if (res_tangent) {
         tp_debug_print("failed tangent check, aborting arc...\n");
+        return TP_ERR_FAIL;
+    }
+
+    tp_prepared_geometry_t prepared1, prepared2;
+    if (tpPrepareGeometryChange(prev_tc, &circ1_temp, NULL, 1, &prepared1) < 0 ||
+        tpPrepareGeometryChange(tc, NULL, &line2_temp, 0, &prepared2) < 0) {
         return TP_ERR_FAIL;
     }
 
@@ -1271,8 +1328,8 @@ tp_err_t tpCreateArcLineBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, T
 
     tp_debug_print("Passed all tests, updating segments\n");
 
-    tcSetCircleXYZ(prev_tc, &circ1_temp);
-    tcSetLineXYZ(tc, &line2_temp);
+    tpCommitGeometryChange(prev_tc, &prepared1);
+    tpCommitGeometryChange(tc, &prepared2);
 
     //Cleanup any mess from parabolic
     tc->blend_prev = 0;
@@ -1424,13 +1481,21 @@ tp_err_t tpCreateArcArcBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, TC
     blend_tc->coords.arc.uvw = prev_tc->coords.circle.uvw.end;
 
     //set the max velocity to v_plan, since we'll violate constraints otherwise.
-    tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
-            param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk));
+    if (tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
+                param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk)) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     int res_tangent1 = checkTangentAngle(&circ1_temp, &blend_tc->coords.arc.xyz, &geom, &param, tp->cycleTime, false);
     int res_tangent2 = checkTangentAngle(&circ2_temp, &blend_tc->coords.arc.xyz, &geom, &param, tp->cycleTime, true);
     if (res_tangent1 || res_tangent2) {
         tp_debug_print("failed tangent check, aborting arc...\n");
+        return TP_ERR_FAIL;
+    }
+
+    tp_prepared_geometry_t prepared1, prepared2;
+    if (tpPrepareGeometryChange(prev_tc, &circ1_temp, NULL, 1, &prepared1) < 0 ||
+        tpPrepareGeometryChange(tc, &circ2_temp, NULL, 0, &prepared2) < 0) {
         return TP_ERR_FAIL;
     }
 
@@ -1440,8 +1505,8 @@ tp_err_t tpCreateArcArcBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc, TC
 
     tp_debug_print("Passed all tests, updating segments\n");
 
-    tcSetCircleXYZ(prev_tc, &circ1_temp);
-    tcSetCircleXYZ(tc, &circ2_temp);
+    tpCommitGeometryChange(prev_tc, &prepared1);
+    tpCommitGeometryChange(tc, &prepared2);
 
     //Cleanup any mess from parabolic
     tc->blend_prev = 0;
@@ -1502,8 +1567,10 @@ tp_err_t tpCreateLineLineBlend(TP_STRUCT * const tp, TC_STRUCT * const prev_tc,
     blend_tc->coords.arc.uvw = prev_tc->coords.line.uvw.end;
 
     //set the max velocity to v_plan, since we'll violate constraints otherwise.
-    tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
-            param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk));
+    if (tpInitBlendArcFromPrev(tp, prev_tc, blend_tc, param.v_req,
+                param.v_plan, param.a_max, fmin(tc->maxjerk, prev_tc->maxjerk)) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     tp_debug_print("blend_tc target_vel = %g\n", blend_tc->target_vel);
 
@@ -1661,7 +1728,9 @@ int tpAddRigidTap(TP_STRUCT * const tp,
     TC_STRUCT *prev_tc;
     //Assume non-zero error code is failure
     prev_tc = tcqLast(&tp->queue);
-    tcFinalizeLength(prev_tc);
+    if (prev_tc && tcFinalizeLength(prev_tc) < 0) {
+        return TP_ERR_FAIL;
+    }
     tcFlagEarlyStop(prev_tc, &tc);
     int retval = tpAddSegmentToQueue(tp, &tc, true);
     tpRunOptimization(tp);
@@ -2160,7 +2229,9 @@ int tpAddLine(TP_STRUCT * const tp, EmcPose end, int canon_motion_type,
         return TP_ERR_ZERO_LENGTH;
     }
     tc.nominal_length = tc.target;
-    tcClampVelocityByLength(&tc);
+    if (tcClampVelocityByLength(&tc) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     // For linear move, set joint corresponding to a locking indexer axis
     tc.indexer_jnum = indexer_jnum;
@@ -2168,11 +2239,16 @@ int tpAddLine(TP_STRUCT * const tp, EmcPose end, int canon_motion_type,
     //TODO refactor this into its own function
     TC_STRUCT *prev_tc;
     prev_tc = tcqLast(&tp->queue);
+    if (tpValidateFinalization(prev_tc) < 0) {
+        return TP_ERR_FAIL;
+    }
     handleModeChange(prev_tc, &tc);
     if (emcmotConfig->arcBlendEnable){
         tpHandleBlendArc(tp, &tc);
     }
-    tcFinalizeLength(prev_tc);
+    if (prev_tc && tcFinalizeLength(prev_tc) < 0) {
+        return TP_ERR_FAIL;
+    }
     tcFlagEarlyStop(prev_tc, &tc);
 
     int retval = tpAddSegmentToQueue(tp, &tc, true);
@@ -2242,6 +2318,9 @@ int tpAddCircle(TP_STRUCT * const tp,
 
     // Update tc target with existing circular segment
     tc.target = pmCircle9Target(&tc.coords.circle);
+    if (!isfinite(tc.target)) {
+        return TP_ERR_FAIL;
+    }
     if (tc.target < TP_POS_EPSILON) {
         return TP_ERR_ZERO_LENGTH;
     }
@@ -2257,20 +2336,28 @@ int tpAddCircle(TP_STRUCT * const tp,
     tc.vlimit_scale = vlimit_scale;
 
     //Reduce max velocity to match sample rate
-    tcClampVelocityByLength(&tc);
+    if (tcClampVelocityByLength(&tc) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     // Apply acceleration and jerk limits for circular motion
-    tcUpdateArcLimits(&tc);
+    if (tcUpdateArcLimits(&tc) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     TC_STRUCT *prev_tc;
     prev_tc = tcqLast(&tp->queue);
+    if (tpValidateFinalization(prev_tc) < 0) {
+        return TP_ERR_FAIL;
+    }
 
     handleModeChange(prev_tc, &tc);
     if (emcmotConfig->arcBlendEnable){
         tpHandleBlendArc(tp, &tc);
-        findSpiralArcLengthFit(&tc.coords.circle.xyz, &tc.coords.circle.fit);
     }
-    tcFinalizeLength(prev_tc);
+    if (prev_tc && tcFinalizeLength(prev_tc) < 0) {
+        return TP_ERR_FAIL;
+    }
     tcFlagEarlyStop(prev_tc, &tc);
 
     int retval = tpAddSegmentToQueue(tp, &tc, true);
